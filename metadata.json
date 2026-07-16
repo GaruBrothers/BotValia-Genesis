@@ -1,0 +1,6 @@
+{
+  "name": "Botvalia Genesis",
+  "description": "An autonomous AI Employee Generator that scans business websites, extracts detailed structured knowledge, maps relationships in an interactive Knowledge Graph, and crafts high-fidelity customized digital workers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
