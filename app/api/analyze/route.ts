@@ -78,8 +78,37 @@ function extractInternalLinks(html: string, currentUrl: string, origin: string, 
   return [...primaryLinks, ...secondaryLinks].slice(0, 12);
 }
 
-async function crawlWebsite(targetUrl: string): Promise<{ pages: { url: string; content: string }[]; logs: string[] }> {
-  const pages: { url: string; content: string }[] = [];
+interface CrawledPage {
+  url: string;
+  title: string;
+  description: string;
+  headings: string[];
+  content: string;
+}
+
+function extractPageMetadata(html: string): { title: string; description: string; headings: string[] } {
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const title = titleMatch ? titleMatch[1].trim() : "";
+
+  const descMatch = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i) || 
+                    html.match(/<meta[^>]+content=["']([^"']*)["'][^>]+name=["']description["']/i);
+  const description = descMatch ? descMatch[1].trim() : "";
+
+  const headings: string[] = [];
+  const headingRegex = /<h([1-3])[^>]*>([\s\S]*?)<\/h\1>/gi;
+  let match;
+  while ((match = headingRegex.exec(html)) !== null && headings.length < 12) {
+    const text = match[2].replace(/<\/?[^>]+(>|$)/g, " ").replace(/\s+/g, " ").trim();
+    if (text && !headings.includes(text) && text.length < 150) {
+      headings.push(text);
+    }
+  }
+
+  return { title, description, headings };
+}
+
+async function crawlWebsite(targetUrl: string): Promise<{ pages: CrawledPage[]; logs: string[] }> {
+  const pages: CrawledPage[] = [];
   const logs: string[] = [];
   
   // Normalize URL
@@ -104,7 +133,8 @@ async function crawlWebsite(targetUrl: string): Promise<{ pages: { url: string; 
   // Set up queue of URLs to crawl
   const urlsToCrawl = [startUrl];
   const crawledUrls = new Set<string>();
-  const maxPagesToCrawl = 5; // Crawl up to 5 pages
+  const maxPagesToCrawl = 8; // Crawl up to 8 pages for deeper subpaths
+  const batchSize = 3; // Crawl up to 3 pages in parallel batches
   
   const headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -113,51 +143,78 @@ async function crawlWebsite(targetUrl: string): Promise<{ pages: { url: string; 
   };
 
   while (urlsToCrawl.length > 0 && pages.length < maxPagesToCrawl) {
-    const currentUrl = urlsToCrawl.shift()!;
-    if (crawledUrls.has(currentUrl)) continue;
-    crawledUrls.add(currentUrl);
-    
-    try {
-      logs.push(`[CRAWL] Cargando página: ${currentUrl}`);
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 6000); // 6s timeout per page
-      
-      const res = await fetch(currentUrl, { 
-        headers, 
-        signal: controller.signal 
-      });
-      clearTimeout(timeoutId);
-      
-      if (!res.ok) {
-        logs.push(`[CRAWL] Error HTTP ${res.status} al cargar ${currentUrl}`);
+    // Collect next batch of unique, uncrawled URLs
+    const batch: string[] = [];
+    while (urlsToCrawl.length > 0 && batch.length < batchSize && (pages.length + batch.length) < maxPagesToCrawl) {
+      const currentUrl = urlsToCrawl.shift()!;
+      if (!crawledUrls.has(currentUrl)) {
+        crawledUrls.add(currentUrl);
+        batch.push(currentUrl);
+      }
+    }
+
+    if (batch.length === 0) continue;
+
+    logs.push(`[CRAWL] Procesando lote de ${batch.length} páginas en paralelo...`);
+
+    const fetchPromises = batch.map(async (currentUrl) => {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s timeout per page in parallel
+        
+        const res = await fetch(currentUrl, { 
+          headers, 
+          signal: controller.signal 
+        });
+        clearTimeout(timeoutId);
+        
+        if (!res.ok) {
+          return { url: currentUrl, success: false, error: `HTTP ${res.status}` };
+        }
+        
+        const contentType = res.headers.get("content-type") || "";
+        if (!contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) {
+          return { url: currentUrl, success: false, error: "No es HTML" };
+        }
+        
+        const html = await res.text();
+        return { url: currentUrl, success: true, html };
+      } catch (err: any) {
+        return { url: currentUrl, success: false, error: err.message || String(err) };
+      }
+    });
+
+    const results = await Promise.allSettled(fetchPromises);
+
+    for (const result of results) {
+      if (result.status === "rejected") continue;
+      const val = result.value;
+      if (!val.success || !val.html) {
+        logs.push(`[CRAWL] No se pudo acceder a ${val.url}: ${val.error}`);
         continue;
       }
-      
-      const contentType = res.headers.get("content-type") || "";
-      if (!contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) {
-        logs.push(`[CRAWL] Omitiendo recurso no HTML: ${currentUrl}`);
-        continue;
-      }
-      
-      const html = await res.text();
-      const cleanText = extractCleanText(html);
+
+      logs.push(`[CRAWL] Cargada y analizada exitosamente: ${val.url}`);
+      const metadata = extractPageMetadata(val.html);
+      const cleanText = extractCleanText(val.html);
       
       pages.push({
-        url: currentUrl,
-        content: cleanText.substring(0, 6000), // Max 6k chars per page to keep it clean
+        url: val.url,
+        title: metadata.title,
+        description: metadata.description,
+        headings: metadata.headings,
+        content: cleanText.substring(0, 8000), // Max 8k characters per page
       });
-      
+
       // Extract links if we haven't reached our limit
       if (pages.length < maxPagesToCrawl) {
-        const foundLinks = extractInternalLinks(html, currentUrl, origin, hostname);
+        const foundLinks = extractInternalLinks(val.html, val.url, origin, hostname);
         for (const link of foundLinks) {
           if (!crawledUrls.has(link) && !urlsToCrawl.includes(link)) {
             urlsToCrawl.push(link);
           }
         }
       }
-    } catch (err: any) {
-      logs.push(`[CRAWL] No se pudo acceder a ${currentUrl}: ${err.message || err}`);
     }
   }
   
@@ -182,7 +239,14 @@ export async function POST(req: NextRequest) {
         console.log(`Starting crawl for URL: ${url}`);
         const crawlResult = await crawlWebsite(url);
         crawledUrlsList = crawlResult.pages.map(p => p.url);
-        crawledPagesContext = crawlResult.pages.map(p => `URL: ${p.url}\nCONTENIDO EXTRAÍDO:\n${p.content}\n-----------------------------\n`).join("\n");
+        crawledPagesContext = crawlResult.pages.map(p => 
+          `URL: ${p.url}\n` +
+          `TÍTULO DE PÁGINA: ${p.title || 'N/A'}\n` +
+          `DESCRIPCIÓN META: ${p.description || 'N/A'}\n` +
+          `ENCABEZADOS: ${p.headings.join(" | ") || 'N/A'}\n` +
+          `CONTENIDO EXTRAÍDO:\n${p.content}\n` +
+          `-----------------------------\n`
+        ).join("\n");
         console.log(`Successfully crawled ${crawlResult.pages.length} pages.`);
       } catch (crawlErr) {
         console.error("Website crawling failed:", crawlErr);
